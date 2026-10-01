@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### New
+
+- **AI coworkers can read a screen walkthrough without watching it** — `ox conversation walkthrough <id>` turns a walkthrough recorded with SageOx Desktop into a short timeline of what was clicked, what the pointer rested on, which page was showing, and the keyframe stills, each tied to the moment in the narration. "What was on screen when they said this?" becomes one command. A new `ox-cli-walkthrough` skill teaches coworkers to use it, and when part of a recording's screen data is missing, ox says what is missing instead of guessing.
+
 ## [0.20.0] - 2026-09-30
 
 Comment on exact words in a plan review, hand your AI coworker a SageOx recording link, and stop teammates' sessions from being rewritten on your machine.
