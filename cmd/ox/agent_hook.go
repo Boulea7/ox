@@ -24,6 +24,7 @@ import (
 	"github.com/sageox/ox/internal/selfexec"
 	"github.com/sageox/ox/internal/session"
 	"github.com/sageox/ox/internal/session/adapters"
+	"github.com/sageox/ox/internal/session/claudesource"
 )
 
 // ReadHookInput reads hook input from stdin.
@@ -763,11 +764,16 @@ func captureHookEntries(ctx *HookContext, agentID, expectedSessionPath, expected
 		if findErr == nil && sf != "" && sf != state.SessionFile {
 			slog.Info("hook: rediscovered session file", "old", state.SessionFile, "new", sf)
 			state.SessionFile = sf
+			// both offsets belong to the old file: a StartOffset left behind would
+			// make every read skip the first bytes of the new transcript, and
+			// every ownership check start mid-record
 			_ = session.UpdateRecordingStateForAgent(ctx.ProjectRoot, agentID, func(s *session.RecordingState) {
 				s.SessionFile = sf
 				s.SourceOffset = 0 // reset offset for new file
+				s.StartOffset = 0
 			})
 			state.SourceOffset = 0
+			state.StartOffset = 0
 		}
 	}
 
@@ -777,16 +783,44 @@ func captureHookEntries(ctx *HookContext, agentID, expectedSessionPath, expected
 		readOffset = state.StartOffset
 	}
 
+	var sourceSnapshot os.FileInfo
+	if state.AdapterName == "claude-code" {
+		var snapshotErr error
+		sourceSnapshot, snapshotErr = claudesource.Snapshot(state.SessionFile)
+		if snapshotErr != nil {
+			recordHookStatus("read-error")
+			return nil
+		}
+	}
 	entries, newOffset, readErr := reader.ReadFromOffset(state.SessionFile, readOffset)
 	if readErr != nil {
 		slog.Info("hook: incremental read failed", "agentID", agentID, "adapter", state.AdapterName, "file", state.SessionFile, "offset", readOffset, "error", readErr)
 		recordHookStatus("read-error")
 		return nil // non-fatal, will catch up at stop
 	}
-
 	if len(entries) == 0 {
 		recordHookStatus("no-new-entries")
 		return nil
+	}
+	if state.AdapterName == "claude-code" {
+		repoRoot := state.WorkspacePath
+		if repoRoot == "" {
+			repoRoot = ctx.ProjectRoot
+		}
+		// Only the newly read records can be appended by this hook. Require
+		// ownership on each captured turn; finalization rechecks the whole file.
+		if err := claudesource.ValidateRead(state.SessionFile, repoRoot, state.AgentSessionID, readOffset, false, sourceSnapshot); err != nil {
+			slog.Info("hook: Claude source crossed repository boundary", "agentID", agentID, "error", err)
+			// record the status first: once quarantined the recording leaves the
+			// agent's active slot, which recordHookStatus looks it up by
+			recordHookStatus("source-repo-mismatch")
+			if errors.Is(err, claudesource.ErrUntrustedSource) {
+				if markErr := session.SetSourceRejectedAt(state.SessionPath, state.SessionID, true); markErr != nil {
+					slog.Warn("hook: failed to quarantine source", "agentID", agentID, "error", markErr)
+				}
+			}
+			return nil
+		}
 	}
 
 	// filter entries by timestamp — strict After() to prevent boundary leaks

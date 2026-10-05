@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sageox/ox/internal/config"
 	"github.com/sageox/ox/internal/endpoint"
 	"github.com/sageox/ox/internal/fileutil"
 	"github.com/sageox/ox/internal/gitutil"
@@ -27,6 +28,7 @@ import (
 	"github.com/sageox/ox/internal/paths"
 	"github.com/sageox/ox/internal/session"
 	"github.com/sageox/ox/internal/session/adapters"
+	"github.com/sageox/ox/internal/session/claudesource"
 	"github.com/sageox/ox/internal/session/pipeline"
 	"github.com/sageox/ox/pkg/sessionsummary"
 	"github.com/sageox/ox/pkg/summaryeval"
@@ -598,8 +600,19 @@ func (h *SessionFinalizeHandler) detectInDir(sessionsDir, ledgerPath string) ([]
 			hasRaw = true
 		}
 
-		// act on the recording marker probed above
+		// Reuse the liveness probe above; do not let a second probe race with
+		// draft classification or override its evidence.
 		if hasRecordingMarker {
+			// Rejected sources remain local for manual ownership review. Never
+			// restart recovery or clear their recording markers.
+			if marker, readErr := os.ReadFile(recPath); readErr == nil {
+				var rejected struct {
+					SourceRejected bool `json:"source_rejected"`
+				}
+				if json.Unmarshal(marker, &rejected) == nil && rejected.SourceRejected {
+					continue
+				}
+			}
 			if !recStale {
 				h.logger.Debug("skipping session with active recording", "session", name)
 				continue
@@ -611,7 +624,7 @@ func (h *SessionFinalizeHandler) detectInDir(sessionsDir, ledgerPath string) ([]
 				// A busy capture writer can be retried on the next detect pass.
 				recoverErr := fileutil.WithFileLockTimeout(context.Background(), rawPath, h.captureLockWait, func() error {
 					var err error
-					hasRaw, err = recoverRawFromSessionFile(h.logger, recPath, sessionDir, rawPath)
+					hasRaw, err = recoverRawFromSessionFile(h.logger, recPath, sessionDir, rawPath, h.projectRoot)
 					if err != nil {
 						return err
 					}
@@ -921,14 +934,15 @@ func (h *SessionFinalizeHandler) DetectOrphanedForAgent(ledgerPath, agentID stri
 			}
 
 			var state struct {
-				AgentID   string     `json:"agent_id"`
-				ParentPID int        `json:"parent_pid,omitempty"`
-				StoppedAt *time.Time `json:"stopped_at,omitempty"`
+				AgentID        string     `json:"agent_id"`
+				ParentPID      int        `json:"parent_pid,omitempty"`
+				StoppedAt      *time.Time `json:"stopped_at,omitempty"`
+				SourceRejected bool       `json:"source_rejected,omitempty"`
 			}
 			if jsonErr := json.Unmarshal(data, &state); jsonErr != nil {
 				continue
 			}
-			if state.AgentID != agentID {
+			if state.AgentID != agentID || state.SourceRejected {
 				continue
 			}
 
@@ -997,7 +1011,7 @@ func (h *SessionFinalizeHandler) DetectOrphanedForAgent(ledgerPath, agentID stri
 			if sessionsDir != filepath.Join(ledgerPath, "sessions") {
 				recoverErr := fileutil.WithFileLockTimeout(context.Background(), rawPath, h.captureLockWait, func() error {
 					var err error
-					hasRaw, err = recoverRawFromSessionFile(h.logger, recPath, sessionDir, rawPath)
+					hasRaw, err = recoverRawFromSessionFile(h.logger, recPath, sessionDir, rawPath, h.projectRoot)
 					if err != nil {
 						return err
 					}
@@ -1065,6 +1079,12 @@ func (h *SessionFinalizeHandler) BuildPrompt(item *WorkItem) (RunRequest, error)
 	payload, err := extractPayload(item)
 	if err != nil {
 		return RunRequest{}, err
+	}
+
+	// Held for ownership review: do not spend an LLM run on it. ProcessResult
+	// drops the item.
+	if sessionHeldForReview(payload.SessionDir) {
+		return RunRequest{SkipLLM: true}, nil
 	}
 
 	if payload.UploadOnly {
@@ -1201,6 +1221,16 @@ func (h *SessionFinalizeHandler) ProcessResult(item *WorkItem, result *RunResult
 	payload, err := extractPayload(item)
 	if err != nil {
 		return err
+	}
+
+	// Every way into this handler (the periodic scan, an agent's own orphan
+	// sweep, a caller's IPC request) ends here, so this is the one place that
+	// keeps a quarantined recording's transcript out of the Ledger. Dropped, not
+	// failed: retrying cannot change the answer, only a coworker's release can.
+	if sessionHeldForReview(payload.SessionDir) {
+		h.logger.Info("session finalize dropped: recording is held for ownership review",
+			"session", filepath.Base(payload.SessionDir))
+		return nil
 	}
 
 	payload.omitTraces = false
@@ -2869,11 +2899,18 @@ func stampCarrierBeforeReclaim(logger *slog.Logger, sessionDir, rawPath string, 
 	}
 }
 
+// sessionHeldForReview reports whether the recording marker in sessionDir says
+// its native source was quarantined. An unreadable marker is not a quarantine.
+func sessionHeldForReview(sessionDir string) bool {
+	state, err := session.ReadRecordingStateFile(sessionDir)
+	return err == nil && state != nil && state.SourceRejected
+}
+
 // recoverRawFromSessionFile recovers missing capture and drains a dead tail
 // recording from its persisted cursor. The watcher must be stopped first.
 // false, nil means the source was verified empty; errors leave the marker and
 // captured data intact so finalization can retry without losing the native tail.
-func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath string) (bool, error) {
+func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath string, fallbackProjectRoot ...string) (bool, error) {
 	data, err := os.ReadFile(recPath)
 	if err != nil {
 		return false, fmt.Errorf("read recording state: %w", err)
@@ -2881,6 +2918,11 @@ func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath
 	var state session.RecordingState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return false, fmt.Errorf("parse recording state: %w", err)
+	}
+	// Checked before the journal settles: a quarantined recording is kept
+	// exactly as it is, and settling would roll back or rewrite raw.jsonl.
+	if state.SourceRejected {
+		return false, fmt.Errorf("native source quarantined for manual ownership review")
 	}
 	// A capture that died mid-batch leaves raw.jsonl.append.json beside the
 	// transcript. Settle it against the persisted cursor before anything reads
@@ -2892,7 +2934,7 @@ func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath
 	}
 
 	hasRaw := session.HasSubstantiveEntries(rawPath)
-	if state.StoppedAt != nil || (hasRaw && state.WatchMode != "tail") {
+	if state.StoppedAt != nil || (hasRaw && state.WatchMode != "tail" && state.AdapterName != "claude-code") {
 		if hasRaw {
 			stampCarrierBeforeReclaim(logger, sessionDir, rawPath, &state)
 		}
@@ -2943,6 +2985,54 @@ func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath
 	if state.AdapterName == "" {
 		return hasRaw, nil
 	}
+	repoRoot := state.WorkspacePath
+	if state.AdapterName == "pi" && !filepath.IsAbs(repoRoot) {
+		return false, fmt.Errorf("cannot establish repository for legacy Pi recording")
+	}
+	if state.AdapterName == "claude-code" && repoRoot == "" {
+		// Old markers omitted WorkspacePath. Only use the daemon's project
+		// when the captured header binds it to the same repo ID; a native
+		// source path or session filename alone cannot establish ownership.
+		if len(fallbackProjectRoot) > 0 && filepath.IsAbs(fallbackProjectRoot[0]) {
+			if headerRepoID, ok := meta["repo_id"].(string); ok && headerRepoID != "" && headerRepoID == config.GetRepoID(fallbackProjectRoot[0]) {
+				repoRoot = fallbackProjectRoot[0]
+			}
+		}
+		if repoRoot == "" {
+			headerRepoID, _ := meta["repo_id"].(string)
+			if hasRaw && state.WatchMode != "tail" && headerRepoID == "" {
+				// the header names no repository, so nothing proves this capture
+				// foreign and nothing can recheck it: finalize what the hooks
+				// wrote, as before. A header that names another repository is
+				// the opposite of a missing one and is held for review below.
+				logger.Warn("legacy Claude hook capture has no repository to recheck; finalizing it", "session_dir", sessionDir)
+				stampCarrierBeforeReclaim(logger, sessionDir, rawPath, &state)
+				return hasRaw, nil
+			}
+			return false, fmt.Errorf("cannot establish repository for legacy Claude recording")
+		}
+	}
+	if state.AdapterName == "claude-code" && hasRaw && state.WatchMode != "tail" {
+		// A dead hook-mode recording. Every batch in raw.jsonl was ownership-
+		// checked as a hook appended it, so the captured file is finalized
+		// unless the native source PROVES the session crossed repositories.
+		// A source that cannot be rechecked (transcript pruned, worktree
+		// archived, a visited directory deleted) is not proof: refusing to
+		// finalize on that would strand validated data behind a retry loop
+		// that can never succeed.
+		if err := recheckClaudeHookSource(&state, repoRoot, sessionDir); errors.Is(err, claudesource.ErrUntrustedSource) {
+			return false, fmt.Errorf("validate Claude hook source before finalization: %w", err)
+		} else if err != nil {
+			logger.Warn("native Claude source not rechecked; finalizing the validated capture", "session_dir", sessionDir, "err", err)
+		}
+		stampCarrierBeforeReclaim(logger, sessionDir, rawPath, &state)
+		return hasRaw, nil
+	}
+	if state.AdapterName == "claude-code" && state.SessionFile == "" && state.WatchMode != "tail" {
+		// No discovered source does not prove the session was empty. Keep the
+		// marker so later recovery can retry without losing the native identity.
+		return false, fmt.Errorf("cannot verify undiscovered Claude hook source before finalization")
+	}
 	adapter, err := adapters.GetAdapter(state.AdapterName)
 	if err != nil {
 		return false, fmt.Errorf("resolve recovery adapter: %w", err)
@@ -2952,7 +3042,7 @@ func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath
 			return hasRaw, nil
 		}
 		state.SessionFile, err = adapter.FindSessionFile(adapters.SessionLookup{
-			RepoRoot: state.WorkspacePath, AgentID: state.AgentID,
+			RepoRoot: repoRoot, AgentID: state.AgentID,
 			Since: state.StartedAt.Add(-5 * time.Minute), AgentSessionID: state.AgentSessionID,
 		})
 		if err != nil {
@@ -2973,6 +3063,13 @@ func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath
 		}
 	}
 
+	var sourceSnapshot os.FileInfo
+	if state.AdapterName == "claude-code" {
+		sourceSnapshot, err = claudesource.Snapshot(state.SessionFile)
+		if err != nil {
+			return false, fmt.Errorf("stat native session before recovery: %w", err)
+		}
+	}
 	var rawEntries []adapters.RawEntry
 	if reader, ok := adapter.(adapters.IncrementalReader); ok {
 		offset := state.StartOffset
@@ -2994,6 +3091,13 @@ func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath
 	}
 	if err != nil {
 		return false, fmt.Errorf("read native session: %w", err)
+	}
+	if state.AdapterName == "claude-code" {
+		// Cached paths are not permanent authorization: a live Claude session
+		// can append foreign-repo turns after discovery or the last watcher poll.
+		if err := validateClaudeRecoverySource(&state, repoRoot, sessionDir, sourceSnapshot); err != nil {
+			return false, fmt.Errorf("validate native session before recovery: %w", err)
+		}
 	}
 
 	var filtered []adapters.RawEntry
@@ -3062,7 +3166,7 @@ func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath
 	// failure. All newly imported content passes through RawWriter's full
 	// command, built-in, custom and extra-detector redaction stack.
 	tmpPath := rawPath + ".tmp"
-	rw, err := session.NewRawWriterTruncate(tmpPath, state.WorkspacePath)
+	rw, err := session.NewRawWriterTruncate(tmpPath, repoRoot)
 	if err != nil {
 		return false, err
 	}
@@ -3109,6 +3213,34 @@ func recoverRawFromSessionFile(logger *slog.Logger, recPath, sessionDir, rawPath
 	}
 	logger.Info("recovered native session", "session_dir", sessionDir, "entries", written, "source", state.SessionFile)
 	return written > 0, nil
+}
+
+// recheckClaudeHookSource re-verifies a dead hook-mode recording's native
+// source. Only an error wrapping claudesource.ErrUntrustedSource is proof of a
+// foreign turn; every other error means the source could not be checked.
+func recheckClaudeHookSource(state *session.RecordingState, repoRoot, sessionDir string) error {
+	if state.SessionFile == "" {
+		return errors.New("recording does not name a native source")
+	}
+	snapshot, err := claudesource.Snapshot(state.SessionFile)
+	if err != nil {
+		return fmt.Errorf("stat Claude hook source: %w", err)
+	}
+	return validateClaudeRecoverySource(state, repoRoot, sessionDir, snapshot)
+}
+
+func validateClaudeRecoverySource(state *session.RecordingState, repoRoot, sessionDir string, snapshot os.FileInfo) error {
+	err := claudesource.ValidateRecorded(state.SessionFile, repoRoot, state.AgentSessionID, state.StartOffset, snapshot)
+	if errors.Is(err, claudesource.ErrUntrustedSource) {
+		state.SourceRejected = true
+		state.SessionPath = sessionDir
+		// under the state lock and keyed to this recording: a whole-file save of
+		// the copy read earlier would revert a cursor a live capture committed
+		if markErr := session.SetSourceRejectedAt(sessionDir, state.SessionID, true); markErr != nil {
+			return fmt.Errorf("quarantine untrusted native source: %w", errors.Join(err, markErr))
+		}
+	}
+	return err
 }
 
 // isPIDAlive checks if a process with the given PID exists.
