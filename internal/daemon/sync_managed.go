@@ -816,6 +816,7 @@ func (s *SyncScheduler) fetchAndPullLocked(ctx context.Context, opts ManagedRepo
 		diverged      bool
 		pullOutput    []byte
 		pullErr       error
+		ahead         int
 	)
 	for attempt := 1; attempt <= maxFetchPullAttempts; attempt++ {
 		// git fetch
@@ -893,8 +894,12 @@ func (s *SyncScheduler) fetchAndPullLocked(ctx context.Context, opts ManagedRepo
 		_, pullSpan := perf.Start(ctx, "git_pull_rebase")
 		pullArgs := append([]string{"-C", path}, gitHTTPTimeoutFlags()...)
 		pullArgs = append(pullArgs, "pull", "--rebase", "--autostash", "--quiet")
-		pullCmd := gitutil.NewNetworkCmd(ctx, pullArgs...)
+		ahead = gitutil.CommitsAhead(ctx, path)
+		pullCtx, pullCancel := gitutil.PullContext(ctx, ahead, s.ctx)
+		pullCmd := gitutil.NewNetworkCmd(pullCtx, pullArgs...)
 		pullOutput, pullErr = pullCmd.CombinedOutput()
+		pullTimedOut := gitutil.PullTimedOut(pullCtx, pullErr)
+		pullCancel()
 		if pullErr != nil {
 			perf.RecordError(pullSpan, pullErr)
 		}
@@ -902,6 +907,24 @@ func (s *SyncScheduler) fetchAndPullLocked(ctx context.Context, opts ManagedRepo
 
 		if pullErr == nil {
 			break
+		}
+		if pullTimedOut {
+			// the killed pull leaves its rebase behind; clear it now so the
+			// repo is never wedged going into the next cycle
+			if found, abortErr := gitutil.RecoverPullTimeoutInRebase(ctx, path, repoName, ahead, logger); found {
+				result := ManagedRepoPullResult{FetchHeadTime: fetchHeadTime, Diverged: diverged}
+				result.Err = fmt.Errorf("pull timed out after %s with %d commits ahead: %w", gitutil.PullBudget(ahead), ahead, pullErr)
+				if abortErr != nil {
+					result.Issue = &DaemonIssue{
+						Type:            IssueTypeRebaseStuck,
+						Severity:        SeverityError,
+						Repo:            repoName,
+						Summary:         fmt.Sprintf("%s is stuck in a broken rebase state. Run 'git -C %s rebase --abort' manually or 'ox doctor --fix' to recover.", repoName, path),
+						RequiresConfirm: true,
+					}
+				}
+				return result
+			}
 		}
 		if attempt < maxFetchPullAttempts && strings.Contains(string(pullOutput), fetchHeadRaceSignature) {
 			logger.Warn("FETCH_HEAD race detected (interleaved fetch), re-fetching and retrying once",
