@@ -364,7 +364,8 @@ func TestImport_RetryDoesNotPublishPrivateCommits(t *testing.T) {
 		t.Logf("remote metadata: %s", runGit(t, f.bare, "show", "HEAD:"+remoteDoc+"/metadata.json"))
 		t.Logf("remote pointer: %s", runGit(t, f.bare, "show", "HEAD:"+remoteDoc+"/q3-plan.md"))
 	}
-	assert.Error(t, retryErr, "recovery must refuse to publish unrelated private commits")
+	assert.ErrorContains(t, retryErr, "outgoing history includes other commits or a merge",
+		"recovery must refuse to publish unrelated private commits")
 	assert.NotContains(t, out, "Imported:")
 	assert.NotContains(t, out, "Already imported")
 	assert.Equal(t, initial, remoteHead)
@@ -423,7 +424,7 @@ func TestImport_UncommittedRetryRejectsPrivateHistoryBeforeWriting(t *testing.T)
 	stagedBefore := runGit(t, tcPath, "ls-files", "--stage")
 
 	out, err := f.importDoc(false)
-	assert.Error(t, err)
+	assert.ErrorContains(t, err, "outgoing history includes other commits or a merge")
 	assert.NotContains(t, out, "Imported:")
 	assert.NotContains(t, out, "Already imported")
 	assert.Equal(t, privateHead, runGit(t, tcPath, "rev-parse", "HEAD"), "refusing private history must not create an import commit")
@@ -484,7 +485,11 @@ func TestImport_RetryRejectsOtherChangesInImportCommit(t *testing.T) {
 			if name == "private filename with leading space" && runGit(t, f.bare, "ls-tree", "HEAD", "--", ":(literal) .gitattributes") != "" {
 				t.Logf("remote private filename bytes: %q", runGit(t, f.bare, "show", "HEAD: .gitattributes"))
 			}
-			assert.Error(t, err)
+			if name == "unrelated attributes" {
+				assert.ErrorContains(t, err, "unrelated .gitattributes changes")
+			} else {
+				assert.ErrorContains(t, err, "commit includes changes outside this document")
+			}
 			assert.NotContains(t, out, "Imported:")
 			assert.Equal(t, initial, runGit(t, f.bare, "rev-parse", "HEAD"))
 			assert.Empty(t, runGit(t, f.bare, "ls-tree", "HEAD", "--", "private.md"))
@@ -550,7 +555,7 @@ func TestImport_RetryDoesNotRestoreRemovedHistory(t *testing.T) {
 
 			out, err := f.importDoc(false)
 			t.Logf("%s failure retry err=%v output=%q remoteHEAD=%s", failure, err, out, runGit(t, f.bare, "rev-parse", "HEAD"))
-			assert.Error(t, err)
+			assert.ErrorContains(t, err, "outgoing history includes other commits or a merge")
 			assert.NotContains(t, out, "Imported:")
 			assert.Equal(t, initial, runGit(t, f.bare, "rev-parse", "HEAD"))
 			assert.Empty(t, runGit(t, f.bare, "ls-tree", "-r", "HEAD", "--", "removed.md", "data/docs"))
@@ -610,7 +615,7 @@ func TestImport_RetryRejectsDeletedPrivateHistoryAndMerges(t *testing.T) {
 			out, err := f.importDoc(false)
 			remoteHistory := runGit(t, f.bare, "log", "--format=%H", "HEAD", "--", ":(literal)private.md")
 			t.Logf("%s retry err=%v output=%q remotePrivateHistory=%q", name, err, out, remoteHistory)
-			assert.Error(t, err)
+			assert.ErrorContains(t, err, "outgoing history includes other commits or a merge")
 			assert.NotContains(t, out, "Imported:")
 			assert.Equal(t, initial, runGit(t, f.bare, "rev-parse", "HEAD"))
 			assert.Empty(t, remoteHistory)
