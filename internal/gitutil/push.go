@@ -116,6 +116,12 @@ func (o *PushOpts) pushBreaker() *pushBreaker {
 // rejected push and repair. Match it with errors.Is.
 var ErrPushWedged = errors.New("ledger push wedged")
 
+// ErrNeedsPullCycle is returned (wrapped) by PushWithRetry when the retry's
+// rebase stopped and was aborted (typically content conflicts). The tree is
+// back to its pre-retry state; the next pull cycle, which owns the conflict
+// resolution ladder, can reconcile it before the following push.
+var ErrNeedsPullCycle = errors.New("rebase needs pull cycle")
+
 const (
 	// pushWedgeBackoffBase is how long the breaker stays open after it first
 	// trips. Each further trip without an intervening successful push doubles it.
@@ -347,18 +353,26 @@ func PushWithRetry(ctx context.Context, repoPath string, opts PushOpts) error {
 					pullCancel()
 					return fmt.Errorf("restore autostash before pull: %w", err)
 				}
-				pullOut, pullErr := RunGit(pullCtx, repoPath, "pull", "--rebase", "--autostash", "--quiet")
+				// Fetch then rebase onto an explicit ref instead of `git pull
+				// --rebase`: pull rebases onto FETCH_HEAD, which a concurrent
+				// fetch can rewrite ("Cannot rebase onto multiple branches").
+				target, fetchOut, fetchErr := fetchUpstream(pullCtx, repoPath)
+				if fetchErr != nil {
+					pullCancel()
+					return fmt.Errorf("git fetch failed during retry: %s: %w", fetchOut, fetchErr)
+				}
+				pullOut, pullErr := RunGit(pullCtx, repoPath, "rebase", "--autostash", "--fork-point", "--quiet", target)
 				timedOut := PullTimedOut(pullCtx, pullErr)
 				pullCancel()
 				if timedOut {
-					// the killed pull leaves its rebase behind; clear it now
+					// the killed rebase is left behind; clear it now
 					if found, abortErr := RecoverPullTimeoutInRebase(ctx, repoPath, repoPath, ahead, log); found {
 						// report the timeout itself: falling through would run
 						// conflict handling on a rebase that no longer exists
 						if abortErr != nil {
-							return fmt.Errorf("git pull --rebase timed out: %w", abortErr)
+							return fmt.Errorf("git rebase timed out: %w", abortErr)
 						}
-						return fmt.Errorf("git pull --rebase timed out after %s with %d commits ahead: %w", PullBudget(ahead), ahead, pullErr)
+						return fmt.Errorf("git rebase timed out after %s with %d commits ahead: %w", PullBudget(ahead), ahead, pullErr)
 					}
 				}
 				if pullErr != nil {
@@ -387,7 +401,7 @@ func PushWithRetry(ctx context.Context, repoPath string, opts PushOpts) error {
 									abortCtx, abortCancel := context.WithTimeout(ctx, opTimeout)
 									_, _ = RunGit(abortCtx, repoPath, "rebase", "--abort")
 									abortCancel()
-									return fmt.Errorf("git pull --rebase failed during retry: %s (could not list conflicts: %w)", pullOut, listErr)
+									return fmt.Errorf("git rebase failed during retry: %s (could not list conflicts: %w)", pullOut, listErr)
 								}
 								hookCtx, hookCancel := context.WithTimeout(ctx, opTimeout)
 								resolved, hookErr := opts.OnUnresolvedConflicts(hookCtx, repoPath, conflicted)
@@ -408,7 +422,7 @@ func PushWithRetry(ctx context.Context, repoPath string, opts PushOpts) error {
 								abortCtx, abortCancel := context.WithTimeout(ctx, opTimeout)
 								_, _ = RunGit(abortCtx, repoPath, "rebase", "--abort")
 								abortCancel()
-								return fmt.Errorf("git pull --rebase failed during retry: %s", pullOut)
+								return fmt.Errorf("%w: git rebase failed during retry: %s", ErrNeedsPullCycle, pullOut)
 							}
 						} else {
 							log.Info("auto-resolved rebase conflicts", "strategy", "accept-theirs")
@@ -418,7 +432,7 @@ func PushWithRetry(ctx context.Context, repoPath string, opts PushOpts) error {
 						abortCtx, abortCancel := context.WithTimeout(ctx, opTimeout)
 						_, _ = RunGit(abortCtx, repoPath, "rebase", "--abort")
 						abortCancel()
-						return fmt.Errorf("git pull --rebase failed during retry: %s", pullOut)
+						return fmt.Errorf("%w: git rebase failed during retry: %s", ErrNeedsPullCycle, pullOut)
 					}
 				}
 				// A successful pull (or rebase --continue) can still leave conflicts
@@ -456,6 +470,66 @@ func PushWithRetry(ctx context.Context, repoPath string, opts PushOpts) error {
 		return tripPushWedge(log, breaker, repoPath, lastOut, "reconcile_exhausted_attempts")
 	}
 	return fmt.Errorf("git push failed after %d attempts: %s", maxRetries, lastOut)
+}
+
+// cannotLockRef is git's message when two fetches update the same
+// refs/remotes/<remote>/<branch> at once. The other fetcher finishes in
+// moments, so the loser retries rather than treating the repo as broken.
+const cannotLockRef = "cannot lock ref"
+
+// fetchRetryWait is how long to wait before retrying a fetch that lost a ref
+// lock race. Matches the first step of the push loop's linear backoff.
+const fetchRetryWait = time.Second
+
+// fetchUpstream fetches the branch the current branch tracks and returns the
+// remote-tracking ref to rebase onto (e.g. refs/remotes/origin/main). A single
+// cannot-lock-ref failure is retried once.
+func fetchUpstream(ctx context.Context, repoPath string) (target, out string, err error) {
+	remote, source, target, err := upstreamRefs(ctx, repoPath)
+	if err != nil {
+		return "", err.Error(), err
+	}
+	// explicit source:destination so a non-default fetch refspec mapping
+	// (branch.<b>.merge fetched into a differently named tracking ref) still
+	// lands where the rebase looks
+	refspec := "+" + source + ":" + target
+	for try := 0; ; try++ {
+		out, err = RunGit(ctx, repoPath, "fetch", "--quiet", remote, refspec)
+		if err == nil {
+			return target, out, nil
+		}
+		if try > 0 || !strings.Contains(out, cannotLockRef) {
+			return "", out, err
+		}
+		select {
+		case <-time.After(fetchRetryWait):
+		case <-ctx.Done():
+			return "", out, ctx.Err()
+		}
+	}
+}
+
+// upstreamRefs resolves the remote, the remote ref to fetch (branch.<b>.merge)
+// and the remote-tracking ref holding it (@{u}) for HEAD. Without an upstream
+// it falls back to origin and the current branch.
+func upstreamRefs(ctx context.Context, repoPath string) (remote, source, target string, err error) {
+	branchOut, err := RunGit(ctx, repoPath, "symbolic-ref", "--short", "HEAD")
+	if err != nil {
+		return "", "", "", fmt.Errorf("resolve current branch: %w", err)
+	}
+	branch := strings.TrimSpace(branchOut)
+
+	trackOut, trackErr := RunGit(ctx, repoPath, "rev-parse", "--symbolic-full-name", "@{u}")
+	mergeOut, mergeErr := RunGit(ctx, repoPath, "config", "--get", "branch."+branch+".merge")
+	remoteOut, remoteErr := RunGit(ctx, repoPath, "config", "--get", "branch."+branch+".remote")
+	track := strings.TrimSpace(trackOut)
+	merge := strings.TrimSpace(mergeOut)
+	remote = strings.TrimSpace(remoteOut)
+	if trackErr == nil && mergeErr == nil && remoteErr == nil &&
+		strings.HasPrefix(track, "refs/remotes/") && merge != "" && remote != "" {
+		return remote, merge, track, nil
+	}
+	return "origin", "refs/heads/" + branch, "refs/remotes/origin/" + branch, nil
 }
 
 // tripPushWedge opens the breaker for repoPath and returns the error for the
