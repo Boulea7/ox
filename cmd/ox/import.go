@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -555,54 +556,52 @@ func resumeDocImport(ctx context.Context, tcPath, ep, metaPath string, source lf
 				return fmt.Errorf("document has different staged content; leaving it unchanged: %s", path)
 			}
 		}
-		if tracked == len(files) {
-			return nil
-		}
-		if tracked != 0 {
+		if tracked != 0 && tracked != len(files) {
 			return fmt.Errorf("document is only partially committed; leaving it unchanged: %s", metaPath)
 		}
-		if err := commitDocImportSnapshot(ctx, tcPath, filepath.Base(filepath.Dir(metaPath)), files); err != nil {
+		published, err := docImportPublished(ctx, tcPath, files, tracked == 0)
+		if err != nil {
 			return err
 		}
-		resumed = true
+		resumed = !published
+		if published {
+			return nil
+		}
+		if tracked == 0 {
+			// Snapshot preparation adds attributes; publication checks use only document files.
+			if err := commitDocImportSnapshot(ctx, tcPath, filepath.Base(filepath.Dir(metaPath)), maps.Clone(files)); err != nil {
+				return err
+			}
+		}
+		// One attempt with no reconciliation callbacks cannot enter the helper's locking retry path.
+		// Keep the ownership check and push under this lock so other ox writers cannot replace HEAD.
+		if err := pushTeamContext(ctx, tcPath, ep, 1); err != nil {
+			return fmt.Errorf("saved import commit remains local; could not confirm publication; synchronize the team context, then rerun ox import: %w", err)
+		}
+		for path, expected := range files {
+			content, found, err := docImportGitBlob(ctx, tcPath, "HEAD", path)
+			if err != nil {
+				return err
+			}
+			matches := false
+			if found {
+				matches, err = docImportMatchesBlob(ctx, tcPath, path, expected, content)
+				if err != nil {
+					return err
+				}
+			}
+			if !matches {
+				return fmt.Errorf("document changed while publishing; cannot report a successful import: %s", path)
+			}
+		}
 		return nil
 	})
-	if err == nil && !resumed {
-		var published bool
-		published, err = docImportPublished(ctx, tcPath, files)
-		resumed = err == nil && !published
-	}
-	if err == nil && resumed {
-		// A retry must not fetch and rebase away the saved import before publishing it.
-		err = pushTeamContext(ctx, tcPath, ep, 1)
-		if err == nil {
-			err = gitutil.WithRepoLock(ctx, tcPath, func() error {
-				for path, expected := range files {
-					content, found, err := docImportGitBlob(ctx, tcPath, "HEAD", path)
-					if err != nil {
-						return err
-					}
-					matches := false
-					if found {
-						matches, err = docImportMatchesBlob(ctx, tcPath, path, expected, content)
-						if err != nil {
-							return err
-						}
-					}
-					if !matches {
-						return fmt.Errorf("document changed while publishing; cannot report a successful import: %s", path)
-					}
-				}
-				return nil
-			})
-		}
-	}
 	return meta, resumed, err
 }
 
 // docImportPublished checks the native push tracking ref for a previously published document.
 // It does not query the remote; an unknown or ambiguous tracking state cannot authorize a push.
-func docImportPublished(ctx context.Context, tcPath string, files map[string][]byte) (bool, error) {
+func docImportPublished(ctx context.Context, tcPath string, files map[string][]byte, needsCommit bool) (bool, error) {
 	branch, err := gitutil.RunGit(ctx, tcPath, "symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
 		return false, fmt.Errorf("cannot determine import publication: %w", err)
@@ -695,7 +694,62 @@ func docImportPublished(ctx context.Context, tcPath string, files map[string][]b
 			return false, fmt.Errorf("document was previously published and removed; leaving it unchanged: %s", path)
 		}
 	}
+
+	// A branch push sends every ancestor, even when private files were later deleted.
+	// Resume only a single non-merge import commit based directly on the known fork point.
+	// Count from the current push ref so an upstream rewind cannot hide removed history.
+	outgoing, err := gitutil.RunGit(ctx, tcPath, "rev-list", "--parents", "--max-count=2", pushRef+"..HEAD")
+	if err != nil {
+		return false, fmt.Errorf("cannot determine safe import retry history: %w", err)
+	}
+	commits := strings.Fields(outgoing)
+	if needsCommit && len(commits) == 0 {
+		return false, nil
+	}
+	if needsCommit || len(commits) != 2 || commits[1] != forkPoint {
+		return false, fmt.Errorf("saved import remains local; outgoing history includes other commits or a merge; review outgoing commits before synchronizing the team context, then rerun ox import")
+	}
+	if err := docImportCommitOwned(ctx, tcPath, forkPoint, commits[0], files); err != nil {
+		return false, err
+	}
 	return false, nil
+}
+
+// docImportCommitOwned accepts only validated document files and the metadata attributes override.
+func docImportCommitOwned(ctx context.Context, tcPath, parent, commit string, files map[string][]byte) error {
+	// Paths are NUL-delimited data; logging helpers can trim or sanitize valid filename bytes.
+	changed, err := exec.CommandContext(ctx, "git", "-C", tcPath, "diff", "--name-only", "--no-renames", "-z", parent, commit, "--").Output()
+	if err != nil {
+		return fmt.Errorf("inspect import commit: %w", err)
+	}
+	for _, name := range bytes.Split(bytes.TrimSuffix(changed, []byte{0}), []byte{0}) {
+		rel := string(name)
+		path := filepath.Join(tcPath, filepath.FromSlash(rel))
+		if _, owned := files[path]; !owned && rel != ".gitattributes" {
+			return fmt.Errorf("saved import remains local; commit includes changes outside this document; review outgoing commits before synchronizing the team context, then rerun ox import")
+		}
+		mode, err := gitutil.RunGit(ctx, tcPath, "ls-tree", "--format=%(objectmode)", commit, "--", ":(literal)"+rel)
+		if err != nil {
+			return fmt.Errorf("inspect import commit file mode: %w", err)
+		}
+		if mode != "100644" && mode != "100755" {
+			return fmt.Errorf("saved import commit contains a non-regular file; leaving it unchanged")
+		}
+		if rel == ".gitattributes" {
+			before, _, err := docImportGitBlob(ctx, tcPath, parent, path)
+			if err != nil {
+				return err
+			}
+			after, found, err := docImportGitBlob(ctx, tcPath, commit, path)
+			if err != nil {
+				return err
+			}
+			if !found || !bytes.Equal(after, docImportAttributes(before)) {
+				return fmt.Errorf("saved import remains local; commit includes unrelated .gitattributes changes; review outgoing commits before synchronizing the team context, then rerun ox import")
+			}
+		}
+	}
+	return nil
 }
 
 // docImportGitConfig treats only Git's missing-value exit code as an absent setting.
